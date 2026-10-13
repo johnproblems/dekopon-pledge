@@ -2,12 +2,13 @@
 
 [package]
 name = "dekopon-provider-pledge"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"
 description = "Durable commitments ledger provider for Dekopon agents: make, list, and settle promises"
 repository = "https://github.com/johnproblems/dekopon-pledge"
+include = ["src/**", "tests/**", "examples/**", "scripts/**", "README.md", "CHANGELOG.md", "LICENSE-*", "deny.toml", "rust-toolchain.toml"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

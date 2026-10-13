@@ -122,7 +122,7 @@ impl JsonSchema for DurationSpec {
     }
 }
 
-/// A `list` settlement filter: `open`, `settled`, or absent for all.
+/// A `list` settlement filter: `open`, `settled`, `kept`, `dropped`, or absent for all.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StateFilter {
@@ -130,6 +130,10 @@ pub enum StateFilter {
     Open,
     /// Kept and dropped promises only.
     Settled,
+    /// Kept promises only.
+    Kept,
+    /// Dropped promises only.
+    Dropped,
 }
 
 /// Input for `pledge.make`.
@@ -152,7 +156,7 @@ pub struct ListInput {
     /// Only promises owed to this recipient (case-insensitive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Bounded<MAX_TO_BYTES>>,
-    /// Only open or only settled promises; all when absent.
+    /// Only open, settled, kept, or dropped promises; all when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<StateFilter>,
     /// Maximum promises to emit; 100 when absent.
@@ -161,6 +165,9 @@ pub struct ListInput {
     /// Oldest first instead of newest first.
     #[serde(default)]
     pub oldest_first: bool,
+    /// Only open promises past their due time.
+    #[serde(default)]
+    pub overdue_only: bool,
     /// Fail with `none-found` when nothing matches.
     #[serde(default)]
     pub fail_if_none: bool,
@@ -212,6 +219,9 @@ pub struct StatsInput {
     /// Only promises owed to this recipient (case-insensitive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Bounded<MAX_TO_BYTES>>,
+    /// One counts line per recipient, sorted by recipient, instead of the aggregate.
+    #[serde(default)]
+    pub by_recipient: bool,
 }
 
 #[cfg(test)]
@@ -241,6 +251,19 @@ mod tests {
             (Some(StateFilter::Settled), Some(5))
         );
         assert!(serde_json::from_value::<ListInput>(json!({"state": "all"})).is_err());
+        for (word, filter) in [
+            ("open", StateFilter::Open),
+            ("settled", StateFilter::Settled),
+            ("kept", StateFilter::Kept),
+            ("dropped", StateFilter::Dropped),
+        ] {
+            let list: ListInput = serde_json::from_value(json!({"state": word})).unwrap();
+            assert_eq!(list.state, Some(filter), "{word}");
+        }
+        let list: ListInput = serde_json::from_value(json!({})).unwrap();
+        assert!(!list.overdue_only);
+        let stats: StatsInput = serde_json::from_value(json!({})).unwrap();
+        assert!(!stats.by_recipient);
 
         assert!(serde_json::from_value::<KeepInput>(json!({"id": "p-000000"})).is_ok());
         assert!(serde_json::from_value::<DropInput>(json!({"id": "p-000000"})).is_err());

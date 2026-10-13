@@ -77,6 +77,64 @@ fn manifest_lists_six_closed_capabilities() {
             .is_none_or(|required| required == &json!([]))
     );
     assert!(due["properties"]["fail_if_none"].is_object());
+    let list = &capabilities[1].input_schema;
+    let states: Vec<&str> = list["properties"]["state"]["anyOf"][0]["oneOf"]
+        .as_array()
+        .expect("state is an optional enum")
+        .iter()
+        .map(|variant| variant["const"].as_str().expect("string variant"))
+        .collect();
+    assert_eq!(states, ["open", "settled", "kept", "dropped"]);
+    assert_eq!(list["properties"]["overdue_only"]["type"], json!("boolean"));
+    assert_eq!(list["properties"]["overdue_only"]["default"], json!(false));
+    let stats = &capabilities[5].input_schema;
+    assert_eq!(
+        stats["properties"]["by_recipient"]["type"],
+        json!("boolean")
+    );
+    assert_eq!(stats["properties"]["by_recipient"]["default"], json!(false));
+    // Required-field shape of all six schemas (`make` pinned above).
+    for (index, name) in [(1, "list"), (2, "due"), (5, "stats")] {
+        let input = &capabilities[index].input_schema;
+        assert!(
+            input
+                .get("required")
+                .is_none_or(|required| required == &json!([])),
+            "{name} has no required fields"
+        );
+    }
+    assert_eq!(capabilities[3].input_schema["required"], json!(["id"]));
+    assert_eq!(
+        capabilities[4].input_schema["required"],
+        json!(["id", "reason"])
+    );
+    // Property names: renaming a schema property fails this test.
+    for (index, name, expected) in [
+        (0, "make", vec!["due", "text", "to"]),
+        (
+            1,
+            "list",
+            vec![
+                "fail_if_none",
+                "limit",
+                "oldest_first",
+                "overdue_only",
+                "state",
+                "to",
+            ],
+        ),
+        (2, "due", vec!["fail_if_none", "limit", "to", "within"]),
+        (3, "keep", vec!["id", "note"]),
+        (4, "drop", vec!["id", "reason"]),
+        (5, "stats", vec!["by_recipient", "to"]),
+    ] {
+        let properties = capabilities[index].input_schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name} has properties"));
+        let mut keys: Vec<&str> = properties.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, expected, "{name} properties");
+    }
 }
 
 #[test]
@@ -106,19 +164,43 @@ fn every_subcommand_proposes_its_capability() {
             argv(&["list", "--to", "alice", "--open", "--limit", "5"]),
             false,
             "pledge.list",
-            json!({"to": "alice", "state": "open", "limit": 5, "oldest_first": false, "fail_if_none": false}),
+            json!({"to": "alice", "state": "open", "limit": 5, "oldest_first": false, "overdue_only": false, "fail_if_none": false}),
         ),
         (
             argv(&["list"]),
             false,
             "pledge.list",
-            json!({"oldest_first": false, "fail_if_none": false}),
+            json!({"oldest_first": false, "overdue_only": false, "fail_if_none": false}),
         ),
         (
             argv(&["list", "--settled", "--oldest-first", "--fail-if-none"]),
             false,
             "pledge.list",
-            json!({"state": "settled", "oldest_first": true, "fail_if_none": true}),
+            json!({"state": "settled", "oldest_first": true, "overdue_only": false, "fail_if_none": true}),
+        ),
+        (
+            argv(&["list", "--kept"]),
+            false,
+            "pledge.list",
+            json!({"state": "kept", "oldest_first": false, "overdue_only": false, "fail_if_none": false}),
+        ),
+        (
+            argv(&["list", "--dropped"]),
+            false,
+            "pledge.list",
+            json!({"state": "dropped", "oldest_first": false, "overdue_only": false, "fail_if_none": false}),
+        ),
+        (
+            argv(&["list", "--overdue", "--to", "alice", "--fail-if-none"]),
+            false,
+            "pledge.list",
+            json!({"to": "alice", "oldest_first": false, "overdue_only": true, "fail_if_none": true}),
+        ),
+        (
+            argv(&["list", "--open", "--overdue", "--limit", "3"]),
+            false,
+            "pledge.list",
+            json!({"state": "open", "limit": 3, "oldest_first": false, "overdue_only": true, "fail_if_none": false}),
         ),
         (
             argv(&["due", "--within", "1h", "--fail-if-none"]),
@@ -160,7 +242,19 @@ fn every_subcommand_proposes_its_capability() {
             argv(&["stats", "--to", "alice"]),
             false,
             "pledge.stats",
-            json!({"to": "alice"}),
+            json!({"to": "alice", "by_recipient": false}),
+        ),
+        (
+            argv(&["stats", "--by-recipient"]),
+            false,
+            "pledge.stats",
+            json!({"by_recipient": true}),
+        ),
+        (
+            argv(&["stats"]),
+            false,
+            "pledge.stats",
+            json!({"by_recipient": false}),
         ),
     ] {
         match provider::command::<Pledge>(&words, piped) {
@@ -203,6 +297,9 @@ fn invalid_argv_fails_pure_without_an_import() {
     // Clap-level refusals render help or usage errors with nonzero status.
     for words in [
         argv(&["list", "--open", "--settled"]),
+        argv(&["list", "--kept", "--dropped"]),
+        argv(&["list", "--open", "--kept"]),
+        argv(&["list", "--settled", "--dropped"]),
         argv(&["drop", "p-7f3a9c"]),
         argv(&["make", "--to", "alice"]),
         argv(&["bogus"]),
@@ -234,5 +331,76 @@ fn invalid_argv_fails_pure_without_an_import() {
             assert!(!stdout.contains('\u{1b}'));
         }
         outcome => panic!("--help must render, got {outcome:?}"),
+    }
+}
+
+#[test]
+fn version_renders_the_crate_version_purely() {
+    let mut cases = vec![(
+        argv(&["--version"]),
+        format!("pledge {}\n", env!("CARGO_PKG_VERSION")),
+    )];
+    for sub in ["make", "list", "due", "keep", "drop", "stats"] {
+        cases.push((
+            argv(&[sub, "--version"]),
+            format!("pledge-{sub} {}\n", env!("CARGO_PKG_VERSION")),
+        ));
+    }
+    for (words, expected) in cases {
+        match provider::command::<Pledge>(&words, false) {
+            CommandRunOutcome::Rendered {
+                stdout,
+                stderr,
+                status,
+            } => {
+                assert_eq!(status, 0, "{words:?}");
+                assert!(stderr.is_empty(), "{words:?}");
+                assert_eq!(stdout, expected, "{words:?}");
+            }
+            outcome => panic!("{words:?} must render, got {outcome:?}"),
+        }
+    }
+}
+
+#[test]
+fn every_subcommand_help_names_the_subcommand() {
+    for sub in ["make", "list", "due", "keep", "drop", "stats"] {
+        match provider::command::<Pledge>(&argv(&[sub, "--help"]), false) {
+            CommandRunOutcome::Rendered {
+                stdout,
+                stderr,
+                status,
+            } => {
+                assert_eq!(status, 0, "{sub}");
+                assert!(stderr.is_empty(), "{sub}");
+                assert!(stdout.contains(sub), "{sub}");
+                assert!(!stdout.contains('\u{1b}'), "{sub}");
+            }
+            outcome => panic!("{sub} --help must render, got {outcome:?}"),
+        }
+    }
+}
+
+#[test]
+fn malformed_keep_drop_ids_fail_pure_usage() {
+    for words in [
+        argv(&["keep", "xyz"]),
+        argv(&["keep", "p-ZZZZZZ"]),
+        argv(&["keep", ""]),
+        argv(&["keep", "p-7f3a9c00"]),
+        argv(&["drop", "xyz", "--reason", "no longer needed"]),
+        argv(&["drop", "p-ZZZZZZ", "--reason", "no longer needed"]),
+        argv(&["drop", "", "--reason", "no longer needed"]),
+    ] {
+        match provider::command::<Pledge>(&words, false) {
+            CommandRunOutcome::Failed { error } => {
+                assert_eq!(error.code, "usage", "{words:?}");
+                assert_eq!(
+                    error.message, "the promise id is not p- followed by six hex characters",
+                    "{words:?}"
+                );
+            }
+            outcome => panic!("{words:?} must fail usage, got {outcome:?}"),
+        }
     }
 }

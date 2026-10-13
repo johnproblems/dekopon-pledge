@@ -60,7 +60,11 @@ struct Harness {
 
 impl Harness {
     async fn open(root: &Path, component: &Path) -> Self {
-        let storage = StorageHost::open(root, StorageLimits::default()).expect("storage opens");
+        Self::open_with_limits(root, component, StorageLimits::default()).await
+    }
+
+    async fn open_with_limits(root: &Path, component: &Path, limits: StorageLimits) -> Self {
+        let storage = StorageHost::open(root, limits).expect("storage opens");
         let registry = BrokerProviderRegistry::load_with_storage(
             [component.canonicalize().expect("component path")],
             BrokerHostLimits::default(),
@@ -307,6 +311,82 @@ async fn make_list_keep_stats_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn make_list_drop_stats_round_trip() {
+    let Some(component) = component() else {
+        return;
+    };
+    let root = temp_root();
+    let host = Harness::open(&root.join("storage"), &component).await;
+    let now = clock_at_epoch_millis(T0);
+
+    let first = host
+        .write(
+            "pledge.make",
+            json!({"to": "alice", "due": "2h", "text": "Confirm migration"}),
+            now,
+        )
+        .await;
+    assert_eq!(first.status, 0);
+    let id_dropped = first.lines()[0]["id"].as_str().unwrap().to_owned();
+    let second = host
+        .write(
+            "pledge.make",
+            json!({"to": "bob", "due": "3d", "text": "Review docs"}),
+            now,
+        )
+        .await;
+    assert_eq!(second.status, 0);
+    let id_open = second.lines()[0]["id"].as_str().unwrap().to_owned();
+
+    let dropped = host
+        .write(
+            "pledge.drop",
+            json!({"id": id_dropped, "reason": "no longer needed"}),
+            now,
+        )
+        .await;
+    assert_eq!(dropped.status, 0);
+    assert_eq!(dropped.lines()[0]["state"], "dropped");
+    assert_eq!(dropped.lines()[0]["reason"], "no longer needed");
+
+    let listed = host.read("pledge.list", json!({}), now).await;
+    assert_eq!(listed.status, 0);
+    let lines = listed.lines();
+    assert_eq!(lines.len(), 2);
+    let by_id: std::collections::HashMap<&str, &Value> = lines
+        .iter()
+        .map(|line| (line["id"].as_str().unwrap(), line))
+        .collect();
+    assert_eq!(by_id[id_dropped.as_str()]["state"], "dropped");
+    assert_eq!(by_id[id_dropped.as_str()]["reason"], "no longer needed");
+    assert_eq!(by_id[id_open.as_str()]["state"], "open");
+
+    let stats = host.read("pledge.stats", json!({}), now).await;
+    assert_eq!(stats.status, 0);
+    assert_eq!(
+        stats.lines()[0],
+        json!({"open":1,"kept":0,"dropped":1,"broken":0,"kept_late":0,"on_time_rate":null})
+    );
+
+    // Settling twice still fails `not-open` without writing.
+    for (capability, input) in [
+        ("pledge.keep", json!({"id": id_dropped})),
+        ("pledge.drop", json!({"id": id_dropped, "reason": "again"})),
+    ] {
+        let again = host.write(capability, input, now).await;
+        assert_eq!(again.status, 1);
+        assert_eq!(again.stderr, "no open promise with that id\n");
+        assert!(again.stdout.is_empty());
+    }
+    let stats = host.read("pledge.stats", json!({}), now).await;
+    assert_eq!(stats.lines()[0]["dropped"], 1);
+    assert_eq!(stats.lines()[0]["open"], 1);
+
+    drop(host);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn settle_twice_fails_not_open_and_writes_nothing() {
     let Some(component) = component() else {
         return;
@@ -349,6 +429,65 @@ async fn settle_twice_fails_not_open_and_writes_nothing() {
     let stats = host.read("pledge.stats", json!({}), now).await;
     assert_eq!(stats.lines()[0]["kept"], 1);
     assert_eq!(stats.lines()[0]["open"], 0);
+
+    drop(host);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_settle_ids_fail_usage_and_write_nothing() {
+    use dekopon_broker_host::CommandRunOutcome;
+    let Some(component) = component() else {
+        return;
+    };
+    let root = temp_root();
+    let host = Harness::open(&root.join("storage"), &component).await;
+    let now = clock_at_epoch_millis(T0);
+
+    let made = host
+        .write(
+            "pledge.make",
+            json!({"to": "alice", "due": "2h", "text": "t"}),
+            now,
+        )
+        .await;
+    assert_eq!(made.status, 0);
+
+    for (capability, input) in [
+        ("pledge.keep", json!({"id": "xyz"})),
+        ("pledge.keep", json!({"id": "p-ZZZZZZ"})),
+        ("pledge.keep", json!({"id": ""})),
+        ("pledge.drop", json!({"id": "xyz", "reason": "r"})),
+        ("pledge.drop", json!({"id": "p-ZZZZZZ", "reason": "r"})),
+        ("pledge.drop", json!({"id": "", "reason": "r"})),
+    ] {
+        let refused = host.write(capability, input, now).await;
+        assert_eq!(refused.status, 2);
+        assert_eq!(
+            refused.stderr,
+            "the promise id is not p- followed by six hex characters\n"
+        );
+        assert!(refused.stdout.is_empty());
+    }
+
+    // Unknown-but-well-formed ids still yield `not-open`.
+    let unknown = host
+        .write("pledge.keep", json!({"id": "p-000000"}), now)
+        .await;
+    assert_eq!(unknown.status, 1);
+    assert_eq!(unknown.stderr, "no open promise with that id\n");
+
+    // The argv grammar refuses malformed ids at propose time, before any run.
+    match host.run_command(&["keep", "xyz"], false).await {
+        CommandRunOutcome::Failed { error } => assert_eq!(error.code, "usage"),
+        outcome => panic!("component must refuse a malformed id, got {outcome:?}"),
+    }
+
+    // Nothing was written: the ledger still holds exactly the open promise.
+    let listed = host.read("pledge.list", json!({}), now).await;
+    assert_eq!(listed.status, 0);
+    assert_eq!(listed.lines().len(), 1);
+    assert_eq!(listed.lines()[0]["state"], "open");
 
     drop(host);
     std::fs::remove_dir_all(root).unwrap();
@@ -637,6 +776,81 @@ async fn run_command_through_component_matches_native_proposals() {
         outcome => panic!("component must propose due, got {outcome:?}"),
     }
     match host
+        .run_command(&["keep", "p-7f3a9c", "--note", "done", "quickly"], false)
+        .await
+    {
+        CommandRunOutcome::Proposed {
+            capability, input, ..
+        } => {
+            assert_eq!(capability.as_str(), "pledge.keep");
+            assert_eq!(input, json!({"id": "p-7f3a9c", "note": "done quickly"}));
+        }
+        outcome => panic!("component must propose keep, got {outcome:?}"),
+    }
+    match host
+        .run_command(
+            &["drop", "p-7f3a9c", "--reason", "no", "longer", "needed"],
+            false,
+        )
+        .await
+    {
+        CommandRunOutcome::Proposed {
+            capability, input, ..
+        } => {
+            assert_eq!(capability.as_str(), "pledge.drop");
+            assert_eq!(
+                input,
+                json!({"id": "p-7f3a9c", "reason": "no longer needed"})
+            );
+        }
+        outcome => panic!("component must propose drop, got {outcome:?}"),
+    }
+    match host.run_command(&["list", "--kept"], false).await {
+        CommandRunOutcome::Proposed {
+            capability, input, ..
+        } => {
+            assert_eq!(capability.as_str(), "pledge.list");
+            assert_eq!(
+                input,
+                json!({"state": "kept", "oldest_first": false, "overdue_only": false, "fail_if_none": false})
+            );
+        }
+        outcome => panic!("component must propose list --kept, got {outcome:?}"),
+    }
+    match host
+        .run_command(&["list", "--overdue", "--to", "alice"], false)
+        .await
+    {
+        CommandRunOutcome::Proposed {
+            capability, input, ..
+        } => {
+            assert_eq!(capability.as_str(), "pledge.list");
+            assert_eq!(
+                input,
+                json!({"to": "alice", "oldest_first": false, "overdue_only": true, "fail_if_none": false})
+            );
+        }
+        outcome => panic!("component must propose list --overdue, got {outcome:?}"),
+    }
+    match host.run_command(&["stats"], false).await {
+        CommandRunOutcome::Proposed {
+            capability, input, ..
+        } => {
+            assert_eq!(capability.as_str(), "pledge.stats");
+            assert_eq!(input, json!({"by_recipient": false}));
+        }
+        outcome => panic!("component must propose stats, got {outcome:?}"),
+    }
+    match host.run_command(&["stats", "--by-recipient"], false).await {
+        CommandRunOutcome::Proposed {
+            capability, input, ..
+        } => {
+            assert_eq!(capability.as_str(), "pledge.stats");
+            assert_eq!(input, json!({"by_recipient": true}));
+        }
+        outcome => panic!("component must propose stats --by-recipient, got {outcome:?}"),
+    }
+    match host
         .run_command(
             &["make", "--to", "alice", "--due", "someday", "do it"],
             false,
@@ -646,12 +860,29 @@ async fn run_command_through_component_matches_native_proposals() {
         CommandRunOutcome::Failed { error } => assert_eq!(error.code, "usage"),
         outcome => panic!("component must refuse a bad due, got {outcome:?}"),
     }
+    match host.run_command(&["keep", "xyz"], false).await {
+        CommandRunOutcome::Failed { error } => {
+            assert_eq!(error.code, "usage");
+            assert_eq!(
+                error.message,
+                "the promise id is not p- followed by six hex characters"
+            );
+        }
+        outcome => panic!("component must refuse a malformed id, got {outcome:?}"),
+    }
     match host.run_command(&["--help"], false).await {
         CommandRunOutcome::Rendered { status, stdout, .. } => {
             assert_eq!(status, 0);
             assert!(stdout.contains("pledge"));
         }
         outcome => panic!("component must render help, got {outcome:?}"),
+    }
+    match host.run_command(&["--version"], false).await {
+        CommandRunOutcome::Rendered { status, stdout, .. } => {
+            assert_eq!(status, 0);
+            assert_eq!(stdout, format!("pledge {}\n", env!("CARGO_PKG_VERSION")));
+        }
+        outcome => panic!("component must render version, got {outcome:?}"),
     }
 
     drop(host);
@@ -771,6 +1002,124 @@ async fn corrupt_ledger_line_fails_reads_loudly() {
         assert!(broken.stdout.is_empty());
     }
 
+    // Writes fail just as loudly and append nothing.
+    let before = std::fs::read(&ledger).unwrap();
+    for (capability, input) in [
+        ("pledge.make", json!({"to": "b", "due": "2h", "text": "t"})),
+        ("pledge.keep", json!({"id": "p-000000"})),
+        ("pledge.drop", json!({"id": "p-000000", "reason": "r"})),
+    ] {
+        let broken = host.write(capability, input, now).await;
+        assert_eq!(broken.status, 1, "{capability}");
+        assert_eq!(broken.stderr, "the promise ledger is corrupt\n");
+        assert!(broken.stdout.is_empty(), "{capability}");
+        assert_eq!(std::fs::read(&ledger).unwrap(), before, "{capability}");
+    }
+
+    drop(host);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clock_past_year_9999_fails_writes_in_wasm() {
+    let Some(component) = component() else {
+        return;
+    };
+    let root = temp_root();
+    let host = Harness::open(&root.join("storage"), &component).await;
+    let now = clock_at_epoch_millis(T0);
+
+    let made = host
+        .write(
+            "pledge.make",
+            json!({"to": "a", "due": "2h", "text": "t"}),
+            now,
+        )
+        .await;
+    assert_eq!(made.status, 0);
+
+    // `MAX_MILLIS + 1`: the broker clock reads past year 9999.
+    let far = clock_at_epoch_millis(253_402_300_800_000);
+    let refused = host
+        .write(
+            "pledge.make",
+            json!({"to": "b", "due": "2h", "text": "t"}),
+            far,
+        )
+        .await;
+    assert_eq!(refused.status, 1);
+    assert_eq!(refused.stderr, "the broker clock is past year 9999\n");
+    assert!(refused.stdout.is_empty());
+
+    // The refused write appended nothing; normal operations still succeed.
+    let listed = host.read("pledge.list", json!({}), now).await;
+    assert_eq!(listed.status, 0);
+    assert_eq!(listed.lines().len(), 1);
+    let again = host
+        .write(
+            "pledge.make",
+            json!({"to": "c", "due": "2h", "text": "u"}),
+            now,
+        )
+        .await;
+    assert_eq!(again.status, 0);
+
+    drop(host);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversize_ledger_fails_reads_in_wasm() {
+    let Some(component) = component() else {
+        return;
+    };
+    let root = temp_root();
+    let storage_root = root.join("storage");
+    // Raised host caps so the >16 MiB ledger reaches the guest's own fold
+    // bound: with default host limits the invocation setup refuses first.
+    let host = Harness::open_with_limits(
+        &storage_root,
+        &component,
+        StorageLimits {
+            max_file_bytes: 32 * 1024 * 1024,
+            max_read_bytes_per_invocation: 32 * 1024 * 1024,
+            ..StorageLimits::default()
+        },
+    )
+    .await;
+    let now = clock_at_epoch_millis(T0);
+
+    host.write(
+        "pledge.make",
+        json!({"to": "a", "due": "2h", "text": "t"}),
+        now,
+    )
+    .await;
+    let listed = host.read("pledge.list", json!({}), now).await;
+    assert_eq!(listed.status, 0);
+    assert_eq!(listed.lines().len(), 1);
+
+    let ledger = find_ledger_file(&storage_root);
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger)
+            .unwrap();
+        let chunk = vec![b'x'; 1024 * 1024];
+        while std::fs::metadata(&ledger).unwrap().len() <= 16 * 1024 * 1024 {
+            file.write_all(&chunk).unwrap();
+        }
+    }
+
+    let broken = host.read("pledge.list", json!({}), now).await;
+    assert_eq!(broken.status, 1);
+    assert_eq!(
+        broken.stderr,
+        "the promise ledger exceeds the 16 MiB read bound\n"
+    );
+    assert!(broken.stdout.is_empty());
+
     drop(host);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -831,6 +1180,230 @@ async fn minted_ids_are_unique_hex() {
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), 20);
+
+    drop(host);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_by_recipient_reports_sorted_per_recipient_lines() {
+    let Some(component) = component() else {
+        return;
+    };
+    let root = temp_root();
+    let host = Harness::open(&root.join("storage"), &component).await;
+    let now = clock_at_epoch_millis(T0);
+
+    let made_bob = host
+        .write(
+            "pledge.make",
+            json!({"to": "bob", "due": "1h", "text": "second"}),
+            now,
+        )
+        .await;
+    assert_eq!(made_bob.status, 0);
+    let id_bob = made_bob.lines()[0]["id"].as_str().unwrap().to_owned();
+    host.write(
+        "pledge.make",
+        json!({"to": "alice", "due": "1h", "text": "first"}),
+        now,
+    )
+    .await;
+    host.write(
+        "pledge.keep",
+        json!({"id": id_bob}),
+        clock_at_epoch_millis(T0 + 30 * 60_000),
+    )
+    .await;
+
+    let later = clock_at_epoch_millis(T0 + 2 * 3_600_000);
+    let grouped = host
+        .read("pledge.stats", json!({"by_recipient": true}), later)
+        .await;
+    assert_eq!(grouped.status, 0);
+    assert_eq!(
+        grouped.lines(),
+        [
+            json!({"to":"alice","open":1,"kept":0,"dropped":0,"broken":1,"kept_late":0,"on_time_rate":0.0}),
+            json!({"to":"bob","open":0,"kept":1,"dropped":0,"broken":0,"kept_late":0,"on_time_rate":1.0}),
+        ]
+    );
+
+    // `--to` without the flag still narrows to the single aggregate object.
+    let narrowed = host
+        .read("pledge.stats", json!({"to": "alice"}), later)
+        .await;
+    assert_eq!(narrowed.status, 0);
+    assert_eq!(
+        narrowed.lines(),
+        [json!({"open":1,"kept":0,"dropped":0,"broken":1,"kept_late":0,"on_time_rate":0.0})]
+    );
+
+    drop(host);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kept_late_surfaces_on_each_promise() {
+    let Some(component) = component() else {
+        return;
+    };
+    let root = temp_root();
+    let host = Harness::open(&root.join("storage"), &component).await;
+    let now = clock_at_epoch_millis(T0);
+
+    let early = host
+        .write(
+            "pledge.make",
+            json!({"to": "a", "due": "1h", "text": "kept late"}),
+            now,
+        )
+        .await;
+    let id_early = early.lines()[0]["id"].as_str().unwrap().to_owned();
+    let prompt = host
+        .write(
+            "pledge.make",
+            json!({"to": "b", "due": "3h", "text": "kept on time"}),
+            now,
+        )
+        .await;
+    let id_prompt = prompt.lines()[0]["id"].as_str().unwrap().to_owned();
+    host.write(
+        "pledge.make",
+        json!({"to": "c", "due": "3h", "text": "still open"}),
+        now,
+    )
+    .await;
+
+    let half_hour = clock_at_epoch_millis(T0 + 30 * 60_000);
+    let kept = host
+        .write("pledge.keep", json!({"id": id_prompt}), half_hour)
+        .await;
+    assert_eq!(kept.status, 0);
+    assert_eq!(kept.lines()[0]["late"], false);
+
+    let two_hours = clock_at_epoch_millis(T0 + 2 * 3_600_000);
+    let late = host
+        .write("pledge.keep", json!({"id": id_early}), two_hours)
+        .await;
+    assert_eq!(late.status, 0);
+    assert_eq!(late.lines()[0]["late"], true);
+
+    let listed = host.read("pledge.list", json!({}), two_hours).await;
+    let lines = listed.lines();
+    assert_eq!(lines.len(), 3);
+    let late_by_id: std::collections::HashMap<&str, &Value> = lines
+        .iter()
+        .map(|line| (line["id"].as_str().unwrap(), &line["late"]))
+        .collect();
+    assert_eq!(late_by_id[id_early.as_str()], &json!(true));
+    assert_eq!(late_by_id[id_prompt.as_str()], &json!(false));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["to"] == "c" && line["late"] == false)
+    );
+
+    drop(host);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_kept_dropped_and_overdue_filters() {
+    let Some(component) = component() else {
+        return;
+    };
+    let root = temp_root();
+    let host = Harness::open(&root.join("storage"), &component).await;
+    let now = clock_at_epoch_millis(T0);
+
+    let kept = host
+        .write(
+            "pledge.make",
+            json!({"to": "a", "due": "1h", "text": "kept"}),
+            now,
+        )
+        .await;
+    let id_kept = kept.lines()[0]["id"].as_str().unwrap().to_owned();
+    let dropped = host
+        .write(
+            "pledge.make",
+            json!({"to": "b", "due": "1h", "text": "dropped"}),
+            now,
+        )
+        .await;
+    let id_dropped = dropped.lines()[0]["id"].as_str().unwrap().to_owned();
+    host.write(
+        "pledge.make",
+        json!({"to": "c", "due": "2020-01-01T00:00:00Z", "text": "overdue"}),
+        now,
+    )
+    .await;
+
+    assert_eq!(
+        host.write("pledge.keep", json!({"id": id_kept}), now)
+            .await
+            .status,
+        0
+    );
+    assert_eq!(
+        host.write(
+            "pledge.drop",
+            json!({"id": id_dropped, "reason": "withdrawn"}),
+            now
+        )
+        .await
+        .status,
+        0
+    );
+
+    let only_kept = host
+        .read("pledge.list", json!({"state": "kept"}), now)
+        .await;
+    assert_eq!(only_kept.status, 0);
+    assert_eq!(only_kept.lines().len(), 1);
+    assert_eq!(only_kept.lines()[0]["id"], id_kept);
+
+    let only_dropped = host
+        .read("pledge.list", json!({"state": "dropped"}), now)
+        .await;
+    assert_eq!(only_dropped.status, 0);
+    assert_eq!(only_dropped.lines().len(), 1);
+    assert_eq!(only_dropped.lines()[0]["id"], id_dropped);
+
+    let settled = host
+        .read("pledge.list", json!({"state": "settled"}), now)
+        .await;
+    assert_eq!(settled.status, 0);
+    assert_eq!(settled.lines().len(), 2);
+
+    let overdue = host
+        .read("pledge.list", json!({"overdue_only": true}), now)
+        .await;
+    assert_eq!(overdue.status, 0);
+    let lines = overdue.lines();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["to"], "c");
+
+    // `--overdue` composes with `--to`, `--open`, `--limit`, `--fail-if-none`.
+    let narrowed = host
+        .read(
+            "pledge.list",
+            json!({"to": "c", "overdue_only": true, "fail_if_none": true}),
+            now,
+        )
+        .await;
+    assert_eq!(narrowed.status, 0);
+    assert_eq!(narrowed.lines().len(), 1);
+    let empty = host
+        .read(
+            "pledge.list",
+            json!({"to": "a", "overdue_only": true, "fail_if_none": true}),
+            now,
+        )
+        .await;
+    assert_eq!(empty.status, 1);
+    assert_eq!(empty.stderr, "no promise matches\n");
 
     drop(host);
     std::fs::remove_dir_all(root).unwrap();

@@ -3,7 +3,7 @@
 #   make build   compile pledge.wasm (< 1 MiB gate included)
 #   make test    unit + manifest + grammar tests (no component needed)
 #   make e2e     full suite against the real component and real storage
-#   make check   fmt + clippy + full suite, the CI gate
+#   make check   fmt + clippy + deny + machete + e2e (the CI gate)
 #   make clean   drop build artifacts (keeps the toolchain)
 
 COMPONENT := $(CURDIR)/pledge.wasm
@@ -15,7 +15,7 @@ build:
 	scripts/build-component.sh $(COMPONENT)
 
 test:
-	cargo test --locked
+	env -u DEKOPON_PROVIDER_COMPONENT cargo test --locked
 
 e2e: build
 	cargo test --locked
@@ -35,7 +35,7 @@ machete:
 check: fmt clippy deny machete e2e
 
 clean:
-	rm -rf target $(COMPONENT) $(COMPONENT).sha256 pledge-core.wasm
+	rm -rf target $(COMPONENT) $(COMPONENT).sha256
 
 # Install the built component into a broker providers directory:
 #   make install PROVIDERS_DIR=/path/to/providers

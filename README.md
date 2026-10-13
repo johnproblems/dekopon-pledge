@@ -16,11 +16,11 @@ are `ReadOnly`, all `Low` risk — nothing leaves the broker.
 | Capability | Command | Effect |
 |---|---|---|
 | `pledge.make` | `pledge make --to <who> --due <time> <text>` | LocalWrite |
-| `pledge.list` | `pledge list [--to <who>] [--open\|--settled] [--limit N] [--oldest-first] [--fail-if-none]` | ReadOnly |
+| `pledge.list` | `pledge list [--to <who>] [--open\|--settled\|--kept\|--dropped] [--overdue] [--limit N] [--oldest-first] [--fail-if-none]` | ReadOnly |
 | `pledge.due` | `pledge due [--within <dur>] [--to <who>] [--limit N] [--fail-if-none]` | ReadOnly |
 | `pledge.keep` | `pledge keep <id> [--note <text>]` | LocalWrite |
 | `pledge.drop` | `pledge drop <id> --reason <text>` | LocalWrite |
-| `pledge.stats` | `pledge stats [--to <who>]` | ReadOnly |
+| `pledge.stats` | `pledge stats [--to <who>] [--by-recipient]` | ReadOnly |
 
 `--due` accepts RFC 3339 (`2026-10-14T16:00:00-04:00`) or a relative duration
 (`30s`, `30m`, `2h`, `3d`, `2w`, either case). Relative values resolve in
@@ -40,13 +40,21 @@ Exactly one compact JSON object per line, each with a trailing newline, so
 `jq` can filter and count. A settled promise echoes back in full:
 
 ```json
-{"id":"p-7f3a9c","to":"alice","due":"2026-10-14T20:00:00.000Z","text":"Confirm migration finished","made_at":"2026-10-13T14:02:11.000Z","overdue":false,"state":"kept","settled_at":"2026-10-14T19:42:05.000Z","note":"migration done 15:42"}
+{"id":"p-7f3a9c","to":"alice","due":"2026-10-14T20:00:00.000Z","text":"Confirm migration finished","made_at":"2026-10-13T14:02:11.000Z","overdue":false,"late":false,"state":"kept","settled_at":"2026-10-14T19:42:05.000Z","note":"migration done 15:42"}
 ```
 
 `pledge stats` prints one object with the follow-through rate:
 
 ```json
 {"open":1,"kept":1,"dropped":0,"broken":1,"kept_late":0,"on_time_rate":0.5}
+```
+
+With `--by-recipient` it prints one such object per recipient instead, each
+with a `"to"` field, sorted by recipient:
+
+```json
+{"to":"alice","open":1,"kept":0,"dropped":0,"broken":1,"kept_late":0,"on_time_rate":0.0}
+{"to":"bob","open":0,"kept":1,"dropped":0,"broken":0,"kept_late":0,"on_time_rate":1.0}
 ```
 
 `broken` is derived, not stored: an open promise past its due time counts as
@@ -96,6 +104,9 @@ The rules every caller can rely on, each pinned by a test:
 - **Settling is single-shot.** The second settle of an id fails `not-open`
   and writes nothing; a late keep still counts as kept (and is flagged
   `kept_late`), while drops never punish the rate.
+- **Kept-late is per promise.** Every promise renders `"late"`: true only
+  when kept strictly after its due time, false while open, dropped, or kept
+  on time. The aggregate `kept_late` count is the number of such promises.
 
 ## jq cookbook
 
@@ -106,8 +117,8 @@ pledge list --open | jq -s '{open: length, overdue: map(select(.overdue)) | leng
 # The single most overdue promise, as `id to due text`.
 pledge due --within 0m | head -1 | jq -r '"\(.id) \(.to) \(.due) \(.text)"'
 
-# Open promises per recipient.
-pledge list --open | jq -s 'group_by(.to) | map({to: .[0].to, open: length})'
+# Follow-through counts per recipient.
+pledge stats --by-recipient
 
 # Follow-through rate, defaulting an empty ledger to 1.
 pledge stats | jq '.on_time_rate // 1'
@@ -121,8 +132,9 @@ pledge due --within 0m --fail-if-none
 | Code | Exit | Meaning |
 |---|---|---|
 | `not-open` | 1 | Settling an unknown or already-settled id |
-| `bad-due` | 2 | `--due`/`--within` is not RFC 3339 or a duration |
-| `usage` | 2 | Missing text, recipient, reason, or non-positive limit |
+| `bad-due` | 2 | `--due` is not RFC 3339 or a duration |
+| `bad-window` | 2 | `--within` is not a duration like 30s, 30m, 2h, 3d or 2w |
+| `usage` | 2 | Missing text, recipient, reason, non-positive limit, or malformed id |
 | `text-too-long` | 2 | Piped text over 280 UTF-8 bytes |
 | `none-due` | 1 | `due --fail-if-none` found nothing due |
 | `none-found` | 1 | `list --fail-if-none` found nothing matching |
@@ -130,7 +142,8 @@ pledge due --within 0m --fail-if-none
 | `ledger-corrupt` | 1 | A ledger line doesn't parse or the fold is inconsistent |
 | `ledger-too-large` | 1 | The ledger exceeds the 16 MiB read bound |
 | `clock-out-of-range` | 1 | The broker clock reads past year 9999 |
-| `storage-failed` | 1 | Any host storage failure |
+| `storage-busy` | 1 | Storage is busy or timed out; retry the command |
+| `storage-failed` | 1 | A denied, quota, or IO storage failure |
 | `output-closed` | 1 | Stdout closed mid-write |
 
 Messages are static and never echo input.

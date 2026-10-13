@@ -133,16 +133,17 @@ pub fn format_rfc3339(millis: u64) -> Result<String, TimeError> {
 /// to milliseconds.
 pub fn parse_duration(text: &str) -> Result<u64, TimeError> {
     let text = text.trim();
-    let (digits, suffix) = text.split_at(text.len().saturating_sub(1));
+    let suffix = text.chars().last().ok_or(TimeError::Invalid)?;
+    let digits = &text[..text.len() - suffix.len_utf8()];
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(TimeError::Invalid);
     }
     let unit = match suffix {
-        "s" | "S" => 1_000,
-        "m" | "M" => 60_000,
-        "h" | "H" => 3_600_000,
-        "d" | "D" => 86_400_000,
-        "w" | "W" => 604_800_000,
+        's' | 'S' => 1_000,
+        'm' | 'M' => 60_000,
+        'h' | 'H' => 3_600_000,
+        'd' | 'D' => 86_400_000,
+        'w' | 'W' => 604_800_000,
         _ => return Err(TimeError::Invalid),
     };
     digits
@@ -155,8 +156,10 @@ pub fn parse_duration(text: &str) -> Result<u64, TimeError> {
 /// Resolves a `--due` value against the broker clock: an absolute RFC 3339
 /// timestamp passes through, a relative duration is added to `now_ms`.
 pub fn resolve_due(spec: &str, now_ms: u64) -> Result<u64, TimeError> {
-    if let Ok(stamp) = parse_rfc3339(spec) {
-        return Ok(stamp);
+    match parse_rfc3339(spec) {
+        Ok(stamp) => return Ok(stamp),
+        Err(TimeError::OutOfRange) => return Err(TimeError::OutOfRange),
+        Err(TimeError::Invalid) => {}
     }
     let delta = parse_duration(spec)?;
     let stamp = now_ms.checked_add(delta).ok_or(TimeError::OutOfRange)?;
@@ -320,6 +323,13 @@ mod tests {
         );
     }
 
+    #[test]
+    fn durations_with_multibyte_tails_refuse_without_panicking() {
+        for text in ["2é", "é", "h\u{0301}", "12ß", "2h🦀", "🦀"] {
+            assert_eq!(parse_duration(text), Err(TimeError::Invalid), "{text:?}");
+        }
+    }
+
     /// Deterministic xorshift64 for parser fuzzing without new dependencies.
     fn next_random(state: &mut u64) -> u64 {
         let mut x = *state;
@@ -339,6 +349,32 @@ mod tests {
             "30m",
             "0s",
         ];
+        /// Absolute-stamp range edges: year 0001 is well-formed but before
+        /// 1970 (`OutOfRange`); the rest are malformed (`Invalid`).
+        const RANGE_EDGES: [(&str, TimeError); 4] = [
+            ("0001-01-01T00:00:00Z", TimeError::OutOfRange),
+            ("10000-01-01T00:00:00Z", TimeError::Invalid),
+            ("2026-13-01T00:00:00Z", TimeError::Invalid),
+            ("2026-10-32T00:00:00Z", TimeError::Invalid),
+        ];
+        /// Multibyte tails, combining marks, and empty/whitespace strings:
+        /// `Invalid` for every parser, and none may panic.
+        const MULTIBYTE_CORPUS: [&str; 10] = [
+            "2é",
+            "é",
+            "h\u{0301}",
+            "12ß",
+            "2h🦀",
+            "🦀",
+            "",
+            "   ",
+            "\t",
+            " \n\t ",
+        ];
+        /// Pieces for generated multibyte soup.
+        const SOUP_PIECES: [&str; 16] = [
+            "é", "ß", "🦀", "\u{0301}", "h", "m", "s", "d", "w", "2", "0", " ", "\t", "-", "T", "Z",
+        ];
         let mut state = 0x243F_6A88_85A3_08D3;
         let mut rfc_accepts = 0_u32;
         let mut duration_accepts = 0_u32;
@@ -348,6 +384,30 @@ mod tests {
             if index % 100 == 0 {
                 let template = TEMPLATES[(index / 100) % TEMPLATES.len()];
                 assert!(parse_rfc3339(template).is_ok() || parse_duration(template).is_ok());
+            }
+            // Every hundredth case offset by 50 feeds one fixed edge input,
+            // cycling through range edges then multibyte soup.
+            if index % 100 == 50 {
+                let slot = (index / 100) % (RANGE_EDGES.len() + MULTIBYTE_CORPUS.len());
+                if slot < RANGE_EDGES.len() {
+                    let (text, expected) = RANGE_EDGES[slot];
+                    assert_eq!(parse_rfc3339(text), Err(expected), "{text:?}");
+                    assert_eq!(parse_duration(text), Err(TimeError::Invalid), "{text:?}");
+                    assert_eq!(
+                        resolve_due(text, 1_792_008_000_000),
+                        Err(expected),
+                        "{text:?}"
+                    );
+                } else {
+                    let text = MULTIBYTE_CORPUS[slot - RANGE_EDGES.len()];
+                    assert_eq!(parse_rfc3339(text), Err(TimeError::Invalid), "{text:?}");
+                    assert_eq!(parse_duration(text), Err(TimeError::Invalid), "{text:?}");
+                    assert_eq!(
+                        resolve_due(text, 1_792_008_000_000),
+                        Err(TimeError::Invalid),
+                        "{text:?}"
+                    );
+                }
             }
             let pick = next_random(&mut state);
             match pick % 3 {
@@ -365,24 +425,42 @@ mod tests {
                 // Byte soup and template mutations never panic; anything
                 // accepted re-parses to itself.
                 _ => {
-                    let bytes = if pick.is_multiple_of(2) {
-                        let length = (next_random(&mut state) % 32) as usize;
-                        (0..length)
-                            .map(|_| b' ' + (next_random(&mut state) % 95) as u8)
-                            .collect::<Vec<_>>()
+                    let text = if index % 7 == 3 {
+                        let count = (next_random(&mut state) % 6 + 1) as usize;
+                        (0..count)
+                            .map(|_| {
+                                SOUP_PIECES[next_random(&mut state) as usize % SOUP_PIECES.len()]
+                            })
+                            .collect::<String>()
                     } else {
-                        let template =
-                            TEMPLATES[next_random(&mut state) as usize % TEMPLATES.len()];
-                        let mut bytes = template.as_bytes().to_vec();
-                        for _ in 0..=next_random(&mut state) % 3 {
-                            let at = next_random(&mut state) as usize % bytes.len();
-                            bytes[at] = b' ' + (next_random(&mut state) % 95) as u8;
-                        }
-                        bytes
+                        let bytes = if pick.is_multiple_of(2) {
+                            let length = (next_random(&mut state) % 32) as usize;
+                            (0..length)
+                                .map(|_| b' ' + (next_random(&mut state) % 95) as u8)
+                                .collect::<Vec<_>>()
+                        } else {
+                            let template =
+                                TEMPLATES[next_random(&mut state) as usize % TEMPLATES.len()];
+                            let mut bytes = template.as_bytes().to_vec();
+                            for _ in 0..=next_random(&mut state) % 3 {
+                                let at = next_random(&mut state) as usize % bytes.len();
+                                bytes[at] = b' ' + (next_random(&mut state) % 95) as u8;
+                            }
+                            bytes
+                        };
+                        let Ok(text) = String::from_utf8(bytes) else {
+                            continue;
+                        };
+                        text
                     };
-                    let Ok(text) = String::from_utf8(bytes) else {
-                        continue;
-                    };
+                    // An absolute OutOfRange survives resolve_due as OutOfRange.
+                    if parse_rfc3339(&text) == Err(TimeError::OutOfRange) {
+                        assert_eq!(
+                            resolve_due(&text, 0),
+                            Err(TimeError::OutOfRange),
+                            "{text:?}"
+                        );
+                    }
                     if let Ok(stamp) = parse_rfc3339(&text) {
                         rfc_accepts += 1;
                         assert_eq!(
@@ -411,5 +489,20 @@ mod tests {
         assert_eq!(resolve_due("1h", now).unwrap(), now + 3_600_000);
         assert_eq!(resolve_due("tomorrow", now), Err(TimeError::Invalid));
         assert_eq!(resolve_due("1h", u64::MAX), Err(TimeError::OutOfRange));
+    }
+
+    #[test]
+    fn due_resolution_preserves_absolute_out_of_range() {
+        let now = 1_792_008_000_000;
+        assert_eq!(
+            resolve_due("0001-01-01T00:00:00Z", now),
+            Err(TimeError::OutOfRange)
+        );
+        assert_eq!(
+            resolve_due("1969-12-31T23:59:59.999Z", now),
+            Err(TimeError::OutOfRange)
+        );
+        assert_eq!(resolve_due("tomorrow", now), Err(TimeError::Invalid));
+        assert_eq!(resolve_due("2h", now).unwrap(), now + 7_200_000);
     }
 }

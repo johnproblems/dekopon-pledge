@@ -12,12 +12,14 @@ use crate::input::{
     DropInput, DueInput, DueSpec, DurationSpec, KeepInput, ListInput, MakeInput, StateFilter,
     StatsInput,
 };
-use crate::model::{MAX_NOTE_BYTES, MAX_TEXT_BYTES, MAX_TO_BYTES};
+use crate::model::{MAX_NOTE_BYTES, MAX_TEXT_BYTES, MAX_TO_BYTES, valid_id};
 
 /// The `pledge` command word.
 #[derive(Debug, Parser)]
 #[command(
     name = "pledge",
+    version,
+    propagate_version = true,
     about = "A ledger of promises this agent made, and whether it kept them."
 )]
 pub struct Args {
@@ -46,11 +48,20 @@ pub enum Cmd {
         #[arg(long)]
         to: Option<String>,
         /// Only open promises.
-        #[arg(long, conflicts_with = "settled")]
+        #[arg(long, conflicts_with_all = ["settled", "kept", "dropped"])]
         open: bool,
         /// Only settled promises.
-        #[arg(long, conflicts_with = "open")]
+        #[arg(long, conflicts_with_all = ["open", "kept", "dropped"])]
         settled: bool,
+        /// Only kept promises.
+        #[arg(long, conflicts_with_all = ["open", "settled", "dropped"])]
+        kept: bool,
+        /// Only dropped promises.
+        #[arg(long, conflicts_with_all = ["open", "settled", "kept"])]
+        dropped: bool,
+        /// Only open promises past their due time.
+        #[arg(long)]
+        overdue: bool,
         /// Maximum promises to emit.
         #[arg(long)]
         limit: Option<u32>,
@@ -97,6 +108,9 @@ pub enum Cmd {
         /// Only promises owed to this recipient.
         #[arg(long)]
         to: Option<String>,
+        /// One counts line per recipient, sorted by recipient.
+        #[arg(long)]
+        by_recipient: bool,
     },
 }
 
@@ -148,6 +162,9 @@ impl Cmd {
             to,
             open,
             settled,
+            kept,
+            dropped,
+            overdue,
             limit,
             oldest_first,
             fail_if_none,
@@ -158,17 +175,24 @@ impl Cmd {
         if limit == Some(0) {
             return Err(Usage::new("the limit must be positive"));
         }
-        let state = match (open, settled) {
-            (true, true) => return Err(Usage::new("--open and --settled conflict")),
-            (true, false) => Some(StateFilter::Open),
-            (false, true) => Some(StateFilter::Settled),
-            (false, false) => None,
+        let state = match (open, settled, kept, dropped) {
+            (false, false, false, false) => None,
+            (true, false, false, false) => Some(StateFilter::Open),
+            (false, true, false, false) => Some(StateFilter::Settled),
+            (false, false, true, false) => Some(StateFilter::Kept),
+            (false, false, false, true) => Some(StateFilter::Dropped),
+            _ => {
+                return Err(Usage::new(
+                    "--open, --settled, --kept and --dropped conflict",
+                ));
+            }
         };
         Ok(ListInput {
             to: optional_recipient(to)?,
             state,
             limit,
             oldest_first,
+            overdue_only: overdue,
             fail_if_none,
         })
     }
@@ -208,6 +232,11 @@ impl Cmd {
         let Self::Keep { id, note } = self else {
             return Err(Usage::new("not a keep command"));
         };
+        if !valid_id(&id) {
+            return Err(Usage::new(
+                "the promise id is not p- followed by six hex characters",
+            ));
+        }
         let note = note
             .map(|words| bounded::<MAX_NOTE_BYTES>(words.join(" "), "the note"))
             .transpose()?;
@@ -219,6 +248,11 @@ impl Cmd {
         let Self::Drop { id, reason } = self else {
             return Err(Usage::new("not a drop command"));
         };
+        if !valid_id(&id) {
+            return Err(Usage::new(
+                "the promise id is not p- followed by six hex characters",
+            ));
+        }
         let reason = reason.join(" ");
         if reason.trim().is_empty() {
             return Err(Usage::new("a reason is required"));
@@ -231,11 +265,12 @@ impl Cmd {
 
     /// Builds the `stats` input.
     pub fn stats_input(self) -> Result<StatsInput, Usage> {
-        let Self::Stats { to } = self else {
+        let Self::Stats { to, by_recipient } = self else {
             return Err(Usage::new("not a stats command"));
         };
         Ok(StatsInput {
             to: optional_recipient(to)?,
+            by_recipient,
         })
     }
 }

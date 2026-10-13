@@ -35,6 +35,11 @@ storage:
   maxNamespaces: 4096
   maxNamespaceBytes: 67108864
   maxFilesPerNamespace: 64
+  # Ledger ceiling, coupled to the guest MAX_LEDGER_BYTES fold bound in
+  # src/store.rs: maxFileBytes and maxReadBytesPerInvocation stay at 16 MiB
+  # (16777216) together. The guest refuses to fold a larger ledger
+  # (`ledger-too-large`), so a broker cap below that would reject reads the
+  # guest could serve, and one above it would admit ledgers it won't fold.
   maxFileBytes: 16777216
   maxOpenHandles: 256
   maxHandlesPerInvocation: 32

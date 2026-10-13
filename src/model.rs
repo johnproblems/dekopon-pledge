@@ -111,6 +111,17 @@ pub fn fold(bytes: &[u8]) -> Result<Vec<Promise>, PledgeError> {
     Ok(promises)
 }
 
+/// Whether an id has the minted shape: `p-` plus six lowercase hex characters.
+pub(crate) fn valid_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 8
+        && bytes[0] == b'p'
+        && bytes[1] == b'-'
+        && bytes[2..]
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn apply(
     event: StoredEvent,
     promises: &mut Vec<Promise>,
@@ -134,10 +145,10 @@ fn apply(
             text,
             ..
         } => {
-            if id.is_empty() || to.is_empty() || text.is_empty() {
+            if !valid_id(&id) || to.trim().is_empty() || text.trim().is_empty() {
                 return Err(corrupt);
             }
-            if to.len() > MAX_TO_BYTES || text.len() > MAX_TEXT_BYTES || id.len() > MAX_TO_BYTES {
+            if to.len() > MAX_TO_BYTES || text.len() > MAX_TEXT_BYTES {
                 return Err(corrupt);
             }
             if index.contains_key(id.as_str()) {
@@ -163,11 +174,14 @@ fn apply(
             }
             if note
                 .as_ref()
-                .is_some_and(|note| note.is_empty() || note.len() > MAX_NOTE_BYTES)
+                .is_some_and(|note| note.trim().is_empty() || note.len() > MAX_NOTE_BYTES)
             {
                 return Err(corrupt);
             }
             let at_ms = parse_rfc3339(&at).map_err(|_| corrupt)?;
+            if at_ms < promises[slot].made_at_ms {
+                return Err(corrupt);
+            }
             promises[slot].settled = Some(Settled::Kept { at_ms, note });
             Ok(())
         }
@@ -176,10 +190,13 @@ fn apply(
             if promises[slot].settled.is_some() {
                 return Err(corrupt);
             }
-            if reason.is_empty() || reason.len() > MAX_NOTE_BYTES {
+            if reason.trim().is_empty() || reason.len() > MAX_NOTE_BYTES {
                 return Err(corrupt);
             }
             let at_ms = parse_rfc3339(&at).map_err(|_| corrupt)?;
+            if at_ms < promises[slot].made_at_ms {
+                return Err(corrupt);
+            }
             promises[slot].settled = Some(Settled::Dropped { at_ms, reason });
             Ok(())
         }
@@ -247,6 +264,7 @@ pub fn promise_value(promise: &Promise, now_ms: u64) -> Result<Value, PledgeErro
         "text": promise.text,
         "made_at": format_rfc3339(promise.made_at_ms).map_err(|_| PledgeError::LedgerCorrupt)?,
         "overdue": promise.is_overdue(now_ms),
+        "late": promise.was_kept_late(),
     });
     let (state, settled_at, extra) = match &promise.settled {
         None => ("open", None, None),
@@ -274,6 +292,42 @@ pub fn promise_value(promise: &Promise, now_ms: u64) -> Result<Value, PledgeErro
 #[must_use]
 pub fn stats_value(counts: &Stats) -> Value {
     json!({
+        "open": counts.open,
+        "kept": counts.kept,
+        "dropped": counts.dropped,
+        "broken": counts.broken,
+        "kept_late": counts.kept_late,
+        "on_time_rate": counts.on_time_rate,
+    })
+}
+
+/// Computes [`Stats`] per recipient over a set of promises at `now_ms`,
+/// sorted by recipient. Recipients group by their stored spelling.
+#[must_use]
+pub fn stats_by_recipient(promises: &[Promise], now_ms: u64) -> Vec<(String, Stats)> {
+    let mut groups: HashMap<&str, Vec<&Promise>> = HashMap::new();
+    for promise in promises {
+        groups.entry(promise.to.as_str()).or_default().push(promise);
+    }
+    let mut recipients: Vec<&str> = groups.keys().copied().collect();
+    recipients.sort_unstable();
+    recipients
+        .iter()
+        .map(|to| {
+            let owned: Vec<Promise> = groups[to]
+                .iter()
+                .map(|promise| (*promise).clone())
+                .collect();
+            ((*to).to_owned(), stats(&owned, now_ms))
+        })
+        .collect()
+}
+
+/// Renders one recipient's [`Stats`] as a `pledge stats --by-recipient` line.
+#[must_use]
+pub fn recipient_stats_value(to: &str, counts: &Stats) -> Value {
+    json!({
+        "to": to,
         "open": counts.open,
         "kept": counts.kept,
         "dropped": counts.dropped,
@@ -325,9 +379,9 @@ pub fn made_line(
         v: SCHEMA_VERSION,
         ev: "made",
         id,
-        at: format_rfc3339(at_ms).map_err(|_| PledgeError::LedgerCorrupt)?,
+        at: format_rfc3339(at_ms).map_err(|_| PledgeError::ClockOutOfRange)?,
         to,
-        due: format_rfc3339(due_ms).map_err(|_| PledgeError::LedgerCorrupt)?,
+        due: format_rfc3339(due_ms).map_err(|_| PledgeError::ClockOutOfRange)?,
         text,
     };
     serde_json::to_vec(&event).map_err(|_| PledgeError::StorageFailed)
@@ -339,7 +393,7 @@ pub fn kept_line(id: &str, at_ms: u64, note: Option<&str>) -> Result<Vec<u8>, Pl
         v: SCHEMA_VERSION,
         ev: "kept",
         id,
-        at: format_rfc3339(at_ms).map_err(|_| PledgeError::LedgerCorrupt)?,
+        at: format_rfc3339(at_ms).map_err(|_| PledgeError::ClockOutOfRange)?,
         note,
     };
     serde_json::to_vec(&event).map_err(|_| PledgeError::StorageFailed)
@@ -351,7 +405,7 @@ pub fn dropped_line(id: &str, at_ms: u64, reason: &str) -> Result<Vec<u8>, Pledg
         v: SCHEMA_VERSION,
         ev: "dropped",
         id,
-        at: format_rfc3339(at_ms).map_err(|_| PledgeError::LedgerCorrupt)?,
+        at: format_rfc3339(at_ms).map_err(|_| PledgeError::ClockOutOfRange)?,
         reason,
     };
     serde_json::to_vec(&event).map_err(|_| PledgeError::StorageFailed)
@@ -424,6 +478,64 @@ mod tests {
         ] {
             assert_eq!(fold(&bytes), Err(PledgeError::LedgerCorrupt));
         }
+    }
+
+    #[test]
+    fn fold_rejects_ids_outside_the_minted_shape() {
+        let overlong = format!("p-{}", "a".repeat(70));
+        for bad in [
+            "P-7F3A9C",
+            "p-7F3A9C",
+            "p-xyz",
+            "p-7f3a9c00",
+            "p-12345",
+            "p-g00000",
+            "",
+            overlong.as_str(),
+        ] {
+            let line = MADE.replace("p-7f3a9c", bad);
+            assert_eq!(
+                fold(&ledger(&[&line])),
+                Err(PledgeError::LedgerCorrupt),
+                "{bad}"
+            );
+        }
+        assert_eq!(fold(&ledger(&[MADE])).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fold_rejects_settlements_before_the_promise_was_made() {
+        let early = KEPT.replace("2026-10-14T19:42:05.000Z", "2026-10-13T14:02:10.000Z");
+        assert_eq!(
+            fold(&ledger(&[MADE, &early])),
+            Err(PledgeError::LedgerCorrupt)
+        );
+        let early_drop = r#"{"v":1,"ev":"dropped","id":"p-7f3a9c","at":"2026-10-13T14:02:10.999Z","reason":"withdrawn"}"#;
+        assert_eq!(
+            fold(&ledger(&[MADE, early_drop])),
+            Err(PledgeError::LedgerCorrupt)
+        );
+        let same_ms = KEPT.replace("2026-10-14T19:42:05.000Z", "2026-10-13T14:02:11.000Z");
+        assert_eq!(fold(&ledger(&[MADE, &same_ms])).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fold_rejects_blank_after_trim_text_but_keeps_the_original() {
+        let blank_to = MADE.replace("alice", "   ");
+        let blank_text = MADE.replace("Confirm migration finished", "\\t");
+        let blank_note = KEPT.replace("migration done 15:42", "  ");
+        let blank_reason = r#"{"v":1,"ev":"dropped","id":"p-7f3a9c","at":"2026-10-14T19:42:05.000Z","reason":" \t "}"#;
+        for bytes in [
+            ledger(&[&blank_to]),
+            ledger(&[&blank_text]),
+            ledger(&[MADE, &blank_note]),
+            ledger(&[MADE, blank_reason]),
+        ] {
+            assert_eq!(fold(&bytes), Err(PledgeError::LedgerCorrupt));
+        }
+        let padded = MADE.replace("alice", " alice ");
+        let promises = fold(&ledger(&[&padded])).unwrap();
+        assert_eq!(promises[0].to, " alice ");
     }
 
     #[test]
@@ -545,5 +657,87 @@ mod tests {
         assert_eq!(value["overdue"], false);
         assert_eq!(value["settled_at"], "2026-10-14T19:42:05.000Z");
         assert_eq!(value["note"], "migration done 15:42");
+    }
+
+    #[test]
+    fn promise_output_flags_kept_late_only() {
+        let now = parse_rfc3339("2026-10-15T00:00:00.000Z").unwrap();
+        let promises = fold(&ledger(&[MADE])).unwrap();
+        assert_eq!(promise_value(&promises[0], now).unwrap()["late"], false);
+
+        // Kept on time: false.
+        let promises = fold(&ledger(&[MADE, KEPT])).unwrap();
+        assert_eq!(promise_value(&promises[0], now).unwrap()["late"], false);
+
+        // Kept strictly after the due time: true.
+        let late = KEPT.replace("2026-10-14T19:42:05.000Z", "2026-10-15T00:00:01.000Z");
+        let promises = fold(&ledger(&[MADE, &late])).unwrap();
+        assert_eq!(promise_value(&promises[0], now).unwrap()["late"], true);
+
+        // Dropped, even past due, is never late.
+        let dropped = r#"{"v":1,"ev":"dropped","id":"p-7f3a9c","at":"2026-10-15T00:00:01.000Z","reason":"withdrawn"}"#;
+        let promises = fold(&ledger(&[MADE, dropped])).unwrap();
+        assert_eq!(promise_value(&promises[0], now).unwrap()["late"], false);
+    }
+
+    #[test]
+    fn recipient_stats_group_sort_and_count() {
+        let now = parse_rfc3339("2026-10-15T00:00:00.000Z").unwrap();
+        let bob = MADE.replace("p-7f3a9c", "p-000002").replace("alice", "bob");
+        let kept_bob = KEPT.replace("p-7f3a9c", "p-000002");
+        let promises = fold(&ledger(&[MADE, &bob, &kept_bob])).unwrap();
+        let grouped = stats_by_recipient(&promises, now);
+        assert_eq!(
+            grouped
+                .iter()
+                .map(|(to, _)| to.as_str())
+                .collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
+        assert_eq!(grouped[0].1.open, 1);
+        assert_eq!(grouped[0].1.broken, 1);
+        assert_eq!(grouped[1].1, stats(&promises[1..2], now));
+        assert_eq!(
+            recipient_stats_value(&grouped[1].0, &grouped[1].1),
+            json!({"to":"bob","open":0,"kept":1,"dropped":0,"broken":0,"kept_late":0,"on_time_rate":1.0})
+        );
+        assert!(stats_by_recipient(&[], now).is_empty());
+    }
+
+    #[test]
+    fn write_side_timestamp_failures_are_clock_out_of_range() {
+        use crate::time::MAX_MILLIS;
+
+        let at = parse_rfc3339("2026-10-13T14:02:11.000Z").unwrap();
+        let past_end_of_time = MAX_MILLIS + 1;
+        assert_eq!(
+            made_line("p-abc123", at, "alice", past_end_of_time, "t"),
+            Err(PledgeError::ClockOutOfRange)
+        );
+        assert_eq!(
+            made_line("p-abc123", past_end_of_time, "alice", at, "t"),
+            Err(PledgeError::ClockOutOfRange)
+        );
+        assert_eq!(
+            kept_line("p-abc123", past_end_of_time, None),
+            Err(PledgeError::ClockOutOfRange)
+        );
+        assert_eq!(
+            dropped_line("p-abc123", past_end_of_time, "withdrawn"),
+            Err(PledgeError::ClockOutOfRange)
+        );
+        // Data read back from the ledger is correctly corrupt, not a clock fault.
+        let unfolded = Promise {
+            id: "p-abc123".to_owned(),
+            to: "alice".to_owned(),
+            due_ms: past_end_of_time,
+            text: "t".to_owned(),
+            made_at_ms: at,
+            settled: None,
+        };
+        assert_eq!(
+            promise_value(&unfolded, at),
+            Err(PledgeError::LedgerCorrupt)
+        );
     }
 }

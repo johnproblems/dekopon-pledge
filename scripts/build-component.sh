@@ -15,7 +15,12 @@ command -v wasm-tools >/dev/null 2>&1 || {
 }
 actual_wasm_tools=$(wasm-tools --version | awk '{print $2}')
 if [[ "$actual_wasm_tools" != "$expected_wasm_tools" ]]; then
-  echo "warning: expected wasm-tools $expected_wasm_tools, found $actual_wasm_tools" >&2
+  if [[ "${ALLOW_WASM_TOOLS_MISMATCH:-}" == "1" ]]; then
+    echo "warning: expected wasm-tools $expected_wasm_tools, found $actual_wasm_tools" >&2
+  else
+    echo "error: expected wasm-tools $expected_wasm_tools, found $actual_wasm_tools (set ALLOW_WASM_TOOLS_MISMATCH=1 to override)" >&2
+    exit 1
+  fi
 fi
 
 rustup target add --toolchain "$toolchain" wasm32-unknown-unknown >/dev/null
@@ -30,4 +35,11 @@ if ((size >= 1024 * 1024)); then
   echo "error: component exceeds the 1 MiB budget" >&2
   exit 1
 fi
-(cd "$(dirname "$out")" && sha256sum "$(basename "$out")" >"$(basename "$out").sha256")
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "$(dirname "$out")" && sha256sum "$(basename "$out")" >"$(basename "$out").sha256")
+elif command -v shasum >/dev/null 2>&1; then
+  (cd "$(dirname "$out")" && shasum -a 256 "$(basename "$out")" >"$(basename "$out").sha256")
+else
+  echo "error: sha256sum or shasum is required to write the sidecar file" >&2
+  exit 1
+fi

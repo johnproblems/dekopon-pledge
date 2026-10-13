@@ -24,7 +24,8 @@ use crate::cli::{Args, Cmd};
 use crate::error::{PledgeError, storage};
 use crate::input::{DropInput, DueInput, KeepInput, ListInput, MakeInput, StateFilter, StatsInput};
 use crate::model::{
-    Promise, Settled, dropped_line, fold, kept_line, made_line, promise_value, stats, stats_value,
+    Promise, Settled, dropped_line, fold, kept_line, made_line, promise_value,
+    recipient_stats_value, stats, stats_by_recipient, stats_value, valid_id,
 };
 use crate::store::{PledgeStore, read_ledger};
 use crate::time::MAX_MILLIS;
@@ -88,7 +89,7 @@ fn transact(
             Err(error) => return Err(storage(error)),
         }
     }
-    Err(PledgeError::StorageFailed)
+    Err(PledgeError::StorageBusy)
 }
 
 /// Mints `p-` plus six hex characters from broker entropy.
@@ -237,8 +238,15 @@ impl Capability for List {
                     && match input.state {
                         Some(StateFilter::Open) => promise.settled.is_none(),
                         Some(StateFilter::Settled) => promise.settled.is_some(),
+                        Some(StateFilter::Kept) => {
+                            matches!(promise.settled, Some(Settled::Kept { .. }))
+                        }
+                        Some(StateFilter::Dropped) => {
+                            matches!(promise.settled, Some(Settled::Dropped { .. }))
+                        }
                         None => true,
                     }
+                    && (!input.overdue_only || promise.is_overdue(now_ms))
             })
             .collect();
         if input.oldest_first {
@@ -338,6 +346,9 @@ impl Capability for Keep {
         (store, clock): Self::Needs,
         out: &mut Stdout,
     ) -> Result<(), PledgeError> {
+        if !valid_id(&input.id) {
+            return Err(PledgeError::BadId);
+        }
         let now_ms = clock.now_unix_millis();
         check_clock(now_ms)?;
         let note = input
@@ -381,6 +392,9 @@ impl Capability for Drop {
         (store, clock): Self::Needs,
         out: &mut Stdout,
     ) -> Result<(), PledgeError> {
+        if !valid_id(&input.id) {
+            return Err(PledgeError::BadId);
+        }
         let now_ms = clock.now_unix_millis();
         check_clock(now_ms)?;
         let reason = input.reason.as_str().trim();
@@ -432,6 +446,12 @@ impl Capability for Stats {
             .filter(|promise| recipient_matches(promise, input.to.as_ref().map(|to| to.as_str())))
             .cloned()
             .collect();
+        if input.by_recipient {
+            for (to, counts) in stats_by_recipient(&selected, now_ms) {
+                write_line(out, &recipient_stats_value(&to, &counts))?;
+            }
+            return Ok(());
+        }
         write_line(out, &stats_value(&stats(&selected, now_ms)))
     }
 }
@@ -441,7 +461,7 @@ export!(Pledge);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{FakeStore, append_with_retry};
+    use crate::store::FakeStore;
 
     #[test]
     fn transact_rechecks_after_a_busy_append() {
@@ -503,11 +523,20 @@ mod tests {
     }
 
     #[test]
-    fn unused_append_helper_stays_available() {
-        // `append_with_retry` covers single blind appends; `transact` covers
-        // validated ones. This keeps the helper linked and honest.
+    fn transact_reports_storage_busy_after_two_busy_appends() {
         let store = FakeStore::new();
-        append_with_retry(&store, &made_line_for_test("p-000001")).unwrap();
-        assert_eq!(fold(&store.data.borrow()).unwrap().len(), 1);
+        store.busy_appends.set(2);
+        let error = transact(&store, |_| Ok(made_line_for_test("p-000001"))).unwrap_err();
+        assert_eq!(error, PledgeError::StorageBusy);
+        assert!(store.data.borrow().is_empty());
+    }
+
+    #[test]
+    fn transact_denial_maps_to_storage_failed_and_writes_nothing() {
+        let mut store = FakeStore::new();
+        store.deny_append = true;
+        let error = transact(&store, |_| Ok(made_line_for_test("p-000001"))).unwrap_err();
+        assert_eq!(error, PledgeError::StorageFailed);
+        assert!(store.data.borrow().is_empty());
     }
 }
