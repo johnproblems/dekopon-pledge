@@ -1,0 +1,122 @@
+# dekopon-brokerd — the only process in this example that holds any authority.
+#
+# It owns the socket, the policy, the constraint sets, and the pledge storage
+# namespace, and it writes every decision to stdout as a `broker.decision` or
+# `broker.execution` audit record. The gateway holds none of those.
+#
+# Hygiene, all checked at startup and all fatal:
+#   chmod 0600 broker.yaml policies.cedar
+#   chmod 0700 <socket parent dir>
+# Every path below that is relative is resolved against this file's own
+# directory. The absolute `/home/operator/...` paths are the ones to change:
+# they are runtime state, not repository content.
+apiVersion: dekopon.dev/brokerd/v1alpha1
+
+socketPath: /home/operator/.local/run/dekopon/broker.sock
+
+policiesPath: policies.cedar
+
+# Anything in this file naming a capability the pledge manifest does not
+# declare is a mistake, not an anticipation. Refuse to start rather than warn.
+strict: true
+
+# Build the component first (`make build` in the repository root); check
+# resolves this path and reads its manifest.
+providers:
+  - ../../pledge.wasm
+
+# Broker-owned storage root: every pledge.* storage grant materializes under
+# here, namespaced per scope. Without this block the broker disables provider
+# storage and refuses the constraint sets below at startup. Create it with
+# `mkdir -p` before booting; the broker never creates it for you.
+storage:
+  rootPath: /home/operator/.local/share/dekopon/pledge-storage
+  maxRootBytes: 2147483648
+  maxNamespaces: 4096
+  maxNamespaceBytes: 67108864
+  maxFilesPerNamespace: 64
+  maxFileBytes: 16777216
+  maxOpenHandles: 256
+  maxHandlesPerInvocation: 32
+  maxHostCallsPerInvocation: 4096
+  maxReadBytesPerCall: 262144
+  maxReadBytesPerInvocation: 16777216
+  maxWriteBytesPerCall: 16777216
+  maxWriteBytesPerInvocation: 16777216
+  maxEntropyBytesPerCall: 256
+  maxEntropyBytesPerInvocation: 4096
+  lockTimeoutMs: 5000
+  finalizationBudgetMs: 5000
+  maxActiveInvocations: 64
+  startupMaxEntries: 100000
+
+identities:
+  # Change 1000 to your own UID (`id -u`). See the conditional-write example
+  # in dekopon core for multi-UID socket layouts.
+  - uid: 1000
+    principal: dekopon-gatewayd
+    actor:
+      type: service
+      principal: dekopon-gatewayd
+    attestor:
+      # Segment-boundary prefixes, service name first. This grant lets the
+      # gateway *name* subjects in this range; it resolves none of them to a
+      # principal. The local demo transport declares `tel.15550001111`.
+      namespaces: [tel]
+
+principals:
+  # The only place a declared subject becomes a principal. An unmapped sender
+  # reaches nothing.
+  owner:
+    subjects: [tel.15550001111]
+
+capabilities:
+  # One block per provider. Only the capabilities listed under it run: an
+  # unlisted one is denied `unconstrained-capability` before Cedar is
+  # consulted. Each listed capability inherits the provider's constraints; a
+  # field it sets replaces the inherited one whole.
+  #
+  # Storage access is per capability: reads get read-only JSONL, writes get
+  # read-write JSONL. The scope default is private-conversation: each sender's
+  # ledger is separate. Pledge holds no HTTP grant and needs none — a
+  # capability cannot combine HTTP and storage.
+  pledge:
+    constraints:
+      timeoutMs: 10000
+    capabilities:
+      pledge.make:
+        constraints:
+          storage:
+            interface: jsonl
+            access: read-write
+            scope: private-conversation
+      pledge.list:
+        constraints:
+          storage:
+            interface: jsonl
+            access: read-only
+            scope: private-conversation
+      pledge.due:
+        constraints:
+          storage:
+            interface: jsonl
+            access: read-only
+            scope: private-conversation
+      pledge.keep:
+        constraints:
+          storage:
+            interface: jsonl
+            access: read-write
+            scope: private-conversation
+      pledge.drop:
+        constraints:
+          storage:
+            interface: jsonl
+            access: read-write
+            scope: private-conversation
+      pledge.stats:
+        constraints:
+          storage:
+            interface: jsonl
+            access: read-only
+            scope: private-conversation

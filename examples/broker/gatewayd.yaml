@@ -1,0 +1,68 @@
+# dekopon-gatewayd — the unprivileged half. It hears the question and asks the model; it decides nothing.
+#
+# It holds a local development socket and a model endpoint. It holds no
+# policy and no authorization. Every capability call a session makes is
+# submitted to the broker as an on-behalf-of proposal naming the sender's
+# declared subject, and the broker alone turns that subject into a principal.
+#
+# chmod 0600 gatewayd.yaml. Relative paths resolve against this file's own directory.
+apiVersion: dekopon.dev/gatewayd/v1alpha1
+
+catalogPath: dekopon.yaml
+
+broker:
+  # Must be the socketPath from broker.yaml. serverUid is the UID that owns the
+  # broker process; the client verifies it before sending anything.
+  socketPath: /home/operator/.local/run/dekopon/broker.sock
+  serverUid: 1000
+
+transports:
+  # Owner-only Unix socket taking JSON lines. Each line names its subject and
+  # text, e.g.:
+  #   {"subject": "tel.15550001111", "text": "anything I owe anyone?"}
+  # The subject is only a claim: the broker still needs the attestor grant and
+  # the owner mapping in broker.yaml to resolve it to a principal, and the
+  # socket's 0600 mode restricts access to the owner's UID.
+  - name: dev
+    kind: local
+    socketPath: /home/operator/.local/run/dekopon/gatewayd-dev.sock
+    liveness: { mode: native, progress: message, stream: true }
+
+models:
+  - name: local-reasoning
+    kind: openaiCompatible
+    # Local Ollama. Any OpenAI-compatible chat-completions endpoint works here.
+    # The model never sees a provider credential either way; it only ever
+    # writes shell scripts.
+    endpoint: http://127.0.0.1:11434/v1
+    model: qwen3
+    timeoutMs: 120000
+    classes: [reasoning]
+
+routes:
+  - transport: dev
+    conversation: { kind: [directMessage] }
+    agent: pledge-keeper
+    limits:
+      maxSteps: 8
+      maxCapabilityCalls: 16
+    # Offer the wake tool so the agent can schedule a return visit after
+    # recording a promise (see the standing orders in dekopon.yaml).
+    wakes: true
+    memory:
+      mode: persistent
+      scope: privateConversation
+      idleTimeoutMs: 900000
+      maxTurns: 12
+      maxBytes: 65536
+
+sessions:
+  maxConcurrent: 4
+  replyOnBusy: true
+  maxConversations: 1024
+  assetRetentionBytes: 268435456
+  # Wake persistence; required when any route sets `wakes: true`.
+  wakes:
+    path: /home/operator/.local/share/dekopon/wakes.jsonl
+
+shutdownGraceMs: 120000

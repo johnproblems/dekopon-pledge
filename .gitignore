@@ -1,0 +1,8 @@
+/target/
+pledge.wasm
+pledge.wasm.sha256
+pledge-core.wasm
+*.orig
+*.rej
+.DS_Store
+.crates.env
